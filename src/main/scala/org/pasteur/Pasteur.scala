@@ -9,8 +9,9 @@ import scala.collection.JavaConversions._
 import scala.util.Random
 
 import org.pasteur.HyParView._
+import rx.Observable.OnSubscribe
 import rx.subjects.PublishSubject
-import rx.{Observable, Observer}
+import rx.{Observable, Observer, Subscriber}
 
 object HyParView {
 
@@ -21,7 +22,7 @@ object HyParView {
     val SHUFFLE_NUM_ACTIVE = 3
     val SHUFFLE_NUM_PASSIVE = 3
 
-    abstract class Message(id: UUID, source: Int, dest: Int) {
+    abstract class Message(val id: UUID, val source: Int, val dest: Int) {
         if (source == dest) {
             throw new IllegalArgumentException(
                 "Source and destination must not be equal")
@@ -31,30 +32,77 @@ object HyParView {
                 s"Nodes with null id are not allowed")
     }
 
-    case class Join(id: UUID, source: Int, dest: Int)
+    case class Join(override val id: UUID, override val source: Int,
+                    override val dest: Int) extends Message(id, source, dest)
+
+    case class Disconnect(override val id: UUID, override val source: Int,
+                      override val dest: Int) extends Message(id, source, dest)
+
+    case class ForwardJoin(override val id: UUID, override val source: Int,
+                           override val dest: Int, joinedNode: Int, ttl: Int)
         extends Message(id, source, dest)
 
-    case class Disconnect(id: UUID, source: Int, dest: Int)
-        extends Message(id, source, dest)
-
-    case class ForwardJoin(id: UUID, source: Int, dest: Int,
-                           joinedNode: Int, ttl: Int)
-        extends Message(id, source, dest)
-
-    case class ShuffleRequest(id: UUID, source: Int, dest: Int, ttl: Int,
+    case class ShuffleRequest(override val id: UUID, override val source: Int,
+                              override val dest: Int, ttl: Int,
                               active: Set[Int], passive: Set[Int])
         extends Message(id, source, dest)
 
-    case class ShuffleReply(id: UUID, source: Int, dest: Int,
-                            active: Set[Int])
+    case class ShuffleReply(override val id: UUID, override val source: Int,
+                            override val dest: Int, active: Set[Int])
         extends Message(id, source, dest)
 
 }
 
-class Transmitter {
+trait Underlay {
 
-    val bus = PublishSubject.create[Message]()
+    abstract class ConnectionEvent(nodeId: Int)
+    case class CnxnEstablished(nodeId: Int) extends ConnectionEvent(nodeId)
+    case class CnxnLost(nodeId: Int) extends ConnectionEvent(nodeId)
 
+    /** Takes charge of delivering all notified messages, handling cnxn
+      * failures by notifying on the cnxnEvents Observable.
+      */
+    val sender: Observer[HyParView.Message] = new Observer[Message] {
+        override def onCompleted(): Unit = {
+            // TODO: what?
+        }
+        override def onError(e: Throwable): Unit = {
+            // TODO: what? shouldn't happen
+        }
+        override def onNext(m: Message): Unit = send(m)
+    }
+
+    /** Emits every message received by this node */
+    val receiver: Observable[HyParView.Message] = Observable.create(onConnect)
+
+    /** Setup the inbound connection to start receiving messages from other
+      * members of the cluster.
+      */
+    def onConnect: OnSubscribe[HyParView.Message]
+
+    /** Child classes should publish connection events here */
+    protected[Underlay] val cnxnEvents =
+        PublishSubject.create[ConnectionEvent]()
+
+    def connectionEvents
+    : Observable[ConnectionEvent] = cnxnEvents.asObservable()
+
+    def origin: Int
+
+    protected def send(m: HyParView.Message): Unit
+
+}
+
+class TCPUnderlay(val origin: Int) extends Underlay {
+
+    override def connectionEvents = cnxnEvents.asObservable()
+
+    override protected def send(m: HyParView.Message): Unit = {}
+    override def onConnect = new OnSubscribe[HyParView.Message] {
+        override def call(s: Subscriber[_ >: Message]): Unit = {
+            // Open TCP socket, etc.
+        }
+    }
 }
 
 /** A Node's partial view of the overlay network for a given node. */
@@ -168,23 +216,30 @@ class Overlay(val myId: Int, val fanout: Int) {
 
 }
 
-class HyParView[T](val nodeId: Int,
-                   val contactNode: Int,
-                   val overlay: Overlay,
-                   val inbound: Observable[Message],
-                   val outbound: Observer[Message]) {
+/**
+ *
+ * @param nodeId       my node id
+ * @param contactNode  the node to use when joining the overlay
+ * @param overlay      the overlay network formed as result of gossiping
+ * @param underlay     the underlay network used to gossip
+ */
+class HyParView(val nodeId: Int,
+                val contactNode: Int,
+                val overlay: Overlay,
+                val underlay: Underlay) {
 
-    private val subscription = inbound.subscribe(new Observer[Message] {
-        override def onCompleted(): Unit = ???
-        override def onError(e: Throwable): Unit = ???
-        override def onNext(m: Message): Unit = receive(m)
-    })
-
-    def send(msg: Message): Unit = outbound onNext msg
+    private val subscription = underlay.receiver.subscribe (
+        new Observer[Message] {
+            override def onCompleted(): Unit = ???
+            override def onError(e: Throwable): Unit = ???
+            override def onNext(m: Message): Unit = receive(m)
+        })
 
     def initialize(): Unit = send(new Join(randomUUID(), nodeId, contactNode))
 
     def close(): Unit = subscription.unsubscribe()
+
+    def send(msg: Message): Unit = underlay.sender onNext msg
 
     def receive(msg: Message): Unit = msg match {
 

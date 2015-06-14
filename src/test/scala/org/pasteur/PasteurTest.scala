@@ -1,15 +1,19 @@
 package org.pasteur
 
+import java.util.Random
 import java.util.UUID.randomUUID
-import java.util.{UUID, Random}
+
+import scala.collection.JavaConversions._
+import scala.collection.mutable.ListBuffer
 
 import org.pasteur.HyParView._
 import org.scalatest.{FeatureSpec, ShouldMatchers}
+import rx.Observable.OnSubscribe
+import rx.Subscriber
 import rx.observers.TestObserver
 import rx.subjects.PublishSubject
-import scala.collection.JavaConversions._
 
-class PasteurTest extends FeatureSpec with ShouldMatchers{
+class PasteurTest extends FeatureSpec with ShouldMatchers {
 
     val rand = new Random
     val fanout = 10
@@ -123,13 +127,28 @@ class PasteurTest extends FeatureSpec with ShouldMatchers{
         }
     }
 
+    class MockUnderlay(nodeId: Int) extends Underlay {
+        val out = new TestObserver[Message]()
+        val in = PublishSubject.create[Message]
+        override def origin: Int = nodeId
+        override protected def send(m: Message): Unit = out onNext m
+        override def onConnect = new OnSubscribe[HyParView.Message] {
+            override def call(s: Subscriber[_ >: Message]): Unit = {
+                in subscribe s
+            }
+        }
+    }
+
     class Context {
         val me = 1
         val other = 2
-        val out = new TestObserver[Message]()
-        val in = PublishSubject.create[Message]()
         val ov = new Overlay(me, fanout)
-        val hpv = new HyParView(me, other, ov, in, out)
+        private val und = new MockUnderlay(me)
+
+        val hpv = new HyParView(me, other, ov, und)
+
+        def out: TestObserver[Message] = und.out
+        def in = und.in
 
         def assertNothingEmitted() = {
             out.getOnNextEvents shouldBe empty
