@@ -6,11 +6,14 @@ import java.util.UUID.randomUUID
 import java.util.concurrent.ConcurrentHashMap
 
 import scala.collection.JavaConversions._
+import scala.concurrent.{ExecutionContext, Future}
 import scala.util.Random
 
 import org.pasteur.HyParView._
+import org.pasteur.Underlay.{CnxnEstablished, CnxnLost, ConnectionEvent}
 import rx.Observable.OnSubscribe
 import rx.subjects.PublishSubject
+import rx.subscriptions.CompositeSubscription
 import rx.{Observable, Observer, Subscriber}
 
 object HyParView {
@@ -53,27 +56,20 @@ object HyParView {
 
 }
 
+object Underlay {
+    abstract class ConnectionEvent(val nodeId: Int)
+    case class CnxnEstablished(override val nodeId: Int)
+        extends ConnectionEvent(nodeId)
+    case class CnxnLost(override val nodeId: Int)
+        extends ConnectionEvent(nodeId)
+}
+
 trait Underlay {
-
-    abstract class ConnectionEvent(nodeId: Int)
-    case class CnxnEstablished(nodeId: Int) extends ConnectionEvent(nodeId)
-    case class CnxnLost(nodeId: Int) extends ConnectionEvent(nodeId)
-
-    /** Takes charge of delivering all notified messages, handling cnxn
-      * failures by notifying on the cnxnEvents Observable.
-      */
-    val sender: Observer[HyParView.Message] = new Observer[Message] {
-        override def onCompleted(): Unit = {
-            // TODO: what?
-        }
-        override def onError(e: Throwable): Unit = {
-            // TODO: what? shouldn't happen
-        }
-        override def onNext(m: Message): Unit = send(m)
-    }
 
     /** Emits every message received by this node */
     val receiver: Observable[HyParView.Message] = Observable.create(onConnect)
+
+    implicit val ec: ExecutionContext
 
     /** Setup the inbound connection to start receiving messages from other
       * members of the cluster.
@@ -89,20 +85,35 @@ trait Underlay {
 
     def origin: Int
 
-    protected def send(m: HyParView.Message): Unit
+    final def send(m: HyParView.Message): Unit = {
+        doSend(m).onFailure { case t: Throwable =>
+            cnxnEvents.onNext(Underlay.CnxnLost(m.dest))
+        }
+    }
+
+    def doSend(m: HyParView.Message): Future[HyParView.Message]
+
+    def testConnectionTo(n: Int): Future[Int]
 
 }
 
-class TCPUnderlay(val origin: Int) extends Underlay {
+class TCPUnderlay(val origin: Int)
+                 (implicit val ec: ExecutionContext) extends Underlay {
 
     override def connectionEvents = cnxnEvents.asObservable()
 
-    override protected def send(m: HyParView.Message): Unit = {}
-    override def onConnect = new OnSubscribe[HyParView.Message] {
-        override def call(s: Subscriber[_ >: Message]): Unit = {
-            // Open TCP socket, etc.
-        }
+    override def doSend(m: HyParView.Message)
+    : Future[HyParView.Message] = {
+        // TODO
+        Future.successful(m)
     }
+
+    override def onConnect = new OnSubscribe[HyParView.Message] {
+        // Open TCP socket, etc.
+        override def call(s: Subscriber[_ >: Message]): Unit = ???
+    }
+
+    override def testConnectionTo(n: Int): Future[Int] = ???
 }
 
 /** A Node's partial view of the overlay network for a given node. */
@@ -118,6 +129,8 @@ class Overlay(val myId: Int, val fanout: Int) {
     val maxActiveSize = fanout + 1
     val maxPassiveSize = fanout * 5
 
+    // TODO: these could very well be Sets, just setting a map in case metadata
+    // makes sense, probably not needed
     private val active: util.Map[Int, Int] =
         new ConcurrentHashMap[Int, Int](maxActiveSize)
     private val passive: util.Map[Int, Int] =
@@ -142,10 +155,9 @@ class Overlay(val myId: Int, val fanout: Int) {
     private def chooseFrom(which: util.Map[Int, Int])(n: Int)
     : Set[Int] = Random.shuffle(which.keys).take(n).toSet
 
-    def passiveView: Set[Int] = passive.keySet().toSet
-    def activeView: Set[Int] = active.keySet().toSet
-    @inline
-    def isActiveFull: Boolean = active.size >= maxActiveSize
+    @inline def passiveView: Set[Int] = passive.keySet().toSet
+    @inline def activeView: Set[Int] = active.keySet().toSet
+    @inline def isActiveFull: Boolean = active.size >= maxActiveSize
 
     /**
      * Adds nodeIds to the passive view.  If the size of the view exceeds the
@@ -181,7 +193,7 @@ class Overlay(val myId: Int, val fanout: Int) {
         var dropped: Option[Int] = None
         if (myId != nodeId && !active.contains(nodeId)) {
             if (isActiveFull) {
-                dropped = chooseRandomActive() flatMap removeFromActive
+                dropped = chooseRandomActive() flatMap downgrade
             }
             active put (nodeId, nodeId)
         }
@@ -191,10 +203,18 @@ class Overlay(val myId: Int, val fanout: Int) {
     /** Removes the given node from the Active view, moving it to the passive
       * view.
       */
-    def removeFromActive(nodeId: Int): Option[Int] = {
+    def downgrade(nodeId: Int): Option[Int] = {
         val dropped = Option(active remove nodeId)
         dropped foreach { id => addToPassive(Set(id)) }
         dropped
+    }
+
+    /** Takes a node from the passive into the active view */
+    def upgrade(nodeId: Int): Unit = {
+        val removed = passive remove nodeId
+        if (null != removed) {
+            addToActive(nodeId)
+        }
     }
 
     /** Applies the given function to every node of the active view. */
@@ -213,7 +233,6 @@ class Overlay(val myId: Int, val fanout: Int) {
             Some(Random.shuffle(eligible).head)
         }
     }
-
 }
 
 /**
@@ -226,20 +245,54 @@ class Overlay(val myId: Int, val fanout: Int) {
 class HyParView(val nodeId: Int,
                 val contactNode: Int,
                 val overlay: Overlay,
-                val underlay: Underlay) {
+                val underlay: Underlay)
+               (implicit val ec: ExecutionContext) {
 
-    private val subscription = underlay.receiver.subscribe (
+    import Underlay.ConnectionEvent
+
+    private val subscriptions = new CompositeSubscription
+
+    // Notified when any connection to a Node is established or broken
+    private val cnxnEventHandler = new Observer[ConnectionEvent] {
+        override def onCompleted(): Unit = ???
+        override def onError(e: Throwable): Unit = ???
+        override def onNext(e: ConnectionEvent): Unit = e match {
+            case CnxnEstablished(id) => // TODO: what?
+            case CnxnLost(id) => swapIfActive(id)
+        }
+    }
+
+    subscriptions.add(underlay.connectionEvents.subscribe(cnxnEventHandler))
+    subscriptions.add(underlay.receiver.subscribe (
         new Observer[Message] {
             override def onCompleted(): Unit = ???
             override def onError(e: Throwable): Unit = ???
             override def onNext(m: Message): Unit = receive(m)
         })
+    )
 
     def initialize(): Unit = send(new Join(randomUUID(), nodeId, contactNode))
 
-    def close(): Unit = subscription.unsubscribe()
+    def close(): Unit = subscriptions.unsubscribe()
 
-    def send(msg: Message): Unit = underlay.sender onNext msg
+    /** Send the message to the given node, if the connection is broken it'll
+      * swap the failed node with one from the passive view that is verified
+      * to be reachable.
+      */
+    def send(msg: Message): Unit = underlay.send(msg)
+
+    /** Takes a node from the active view which connection is verified broken,
+      * and swaps it for a reachable node in the passive view.
+      */
+    private def swapIfActive(nodeId: Int) = {
+        val candidateForUpgrade = overlay.chooseFromPassive(1).headOption
+        overlay.downgrade(nodeId) flatMap { _ =>
+            candidateForUpgrade
+        } foreach { candidate =>
+            underlay.testConnectionTo(candidate)
+                    .foreach { overlay.upgrade }
+        }
+    }
 
     def receive(msg: Message): Unit = msg match {
 
@@ -283,7 +336,7 @@ class HyParView(val nodeId: Int,
             }
 
         case Disconnect(msgId, source, _) =>
-            overlay removeFromActive source
+            overlay downgrade source
     }
 
     def forwardShuffle(req: ShuffleRequest): Unit = {

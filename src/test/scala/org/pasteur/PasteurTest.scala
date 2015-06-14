@@ -2,11 +2,14 @@ package org.pasteur
 
 import java.util.Random
 import java.util.UUID.randomUUID
+import java.util.concurrent.Executors.newFixedThreadPool
 
 import scala.collection.JavaConversions._
-import scala.collection.mutable.ListBuffer
+import scala.collection.mutable
+import scala.concurrent.{ExecutionContext, Future}
 
 import org.pasteur.HyParView._
+import org.scalatest.concurrent.Eventually._
 import org.scalatest.{FeatureSpec, ShouldMatchers}
 import rx.Observable.OnSubscribe
 import rx.Subscriber
@@ -39,7 +42,7 @@ class PasteurTest extends FeatureSpec with ShouldMatchers {
             o.myId shouldBe 100
             o.chooseFromActive(rand.nextInt()) shouldBe empty
             o.chooseFromPassive(rand.nextInt()) shouldBe empty
-            o.removeFromActive(rand.nextInt()) shouldBe None
+            o.downgrade(rand.nextInt()) shouldBe None
             o.isActiveFull shouldBe false
             o.activeView shouldBe empty
             o.passiveView shouldBe empty
@@ -127,23 +130,47 @@ class PasteurTest extends FeatureSpec with ShouldMatchers {
         }
     }
 
-    class MockUnderlay(nodeId: Int) extends Underlay {
+    class MockUnderlay(nodeId: Int)
+                      (implicit val ec: ExecutionContext) extends Underlay {
         val out = new TestObserver[Message]()
         val in = PublishSubject.create[Message]
+
+        val scheduledFailures = mutable.HashMap.empty[Int, Throwable]
+
         override def origin: Int = nodeId
-        override protected def send(m: Message): Unit = out onNext m
         override def onConnect = new OnSubscribe[HyParView.Message] {
             override def call(s: Subscriber[_ >: Message]): Unit = {
                 in subscribe s
             }
         }
+
+        override def doSend(m: Message): Future[Message] = {
+            testConnectionTo(m.dest).map { _ =>
+                out onNext m
+                m
+            }
+        }
+
+        override def testConnectionTo(n: Int): Future[Int] = {
+            scheduledFailures.remove(n) match {
+                case None => Future.successful(n)
+                case Some(t) => Future.failed(t)
+            }
+        }
+
+        def failNext(to: Int, t: Throwable): Unit = {
+            scheduledFailures += (to -> t)
+        }
     }
 
     class Context {
+
+        implicit val ec = ExecutionContext.fromExecutor(newFixedThreadPool(2))
+
         val me = 1
         val other = 2
         val ov = new Overlay(me, fanout)
-        private val und = new MockUnderlay(me)
+        val und = new MockUnderlay(me)
 
         val hpv = new HyParView(me, other, ov, und)
 
@@ -217,7 +244,10 @@ class PasteurTest extends FeatureSpec with ShouldMatchers {
                 c.out.getOnCompletedEvents shouldBe empty
                 c.out.getOnErrorEvents shouldBe empty
 
-                c.out.getOnNextEvents should have size n
+                eventually {
+                    c.out.getOnNextEvents should have size n
+                }
+
                 val fwd = c.out.getOnNextEvents.head
                                                .asInstanceOf[ShuffleRequest]
                 fwd.source shouldBe c.me
@@ -245,10 +275,12 @@ class PasteurTest extends FeatureSpec with ShouldMatchers {
 
             c.in.onNext(shuffleReq)
 
-            c.out.getOnCompletedEvents shouldBe empty
-            c.out.getOnErrorEvents shouldBe empty
+            eventually {
+                c.out.getOnCompletedEvents shouldBe empty
+                c.out.getOnErrorEvents shouldBe empty
+                c.out.getOnNextEvents should have size 1
+            }
 
-            c.out.getOnNextEvents should have size 1
             c.ov.passiveView should contain theSameElementsAs shuffled - c.me
             val msg = c.out.getOnNextEvents.head.asInstanceOf[ShuffleReply]
             msg.source shouldBe c.me
@@ -308,4 +340,25 @@ class PasteurTest extends FeatureSpec with ShouldMatchers {
             receivers -- initialActive shouldBe empty
         }
     }
+
+    feature("Failure handling") {
+        scenario("An unreachable active is exchanged with passive") {
+            val c = new Context
+            c.ov.addToActive(c.other)
+            c.ov.addToPassive(Set(3))
+            c.und.failNext(c.other, new Exception("unreachable"))
+
+            // A shuffle to the random peer will try to send to c.other
+            c.hpv.suffleToRandomPeer()
+
+            eventually { // The node was exchanged with a reachable passive
+                c.ov.activeView should contain only 3
+                c.ov.passiveView should contain only c.other
+            }
+
+            // The test correctly injected the failure not transmitting the msg
+            c.und.out.getOnNextEvents shouldBe empty
+        }
+    }
+
 }
